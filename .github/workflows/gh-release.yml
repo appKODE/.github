@@ -1,0 +1,81 @@
+# Reusable: creates the GitHub Release of a pushed version tag, notes = the version's CHANGELOG section.
+#
+#   jobs:
+#     check:              # before publishing: fails on tag/version/changelog mismatch
+#       uses: appKODE/.github/.github/workflows/gh-release.yml@main
+#       with: { check-only: true }
+#     publish:
+#       needs: check
+#       ...
+#     gh-release:
+#       needs: publish
+#       uses: appKODE/.github/.github/workflows/gh-release.yml@main
+#       permissions: { contents: write }
+#
+# CHANGELOG headings: "## 1.2.3 - 2026-01-31" or "## [1.2.3] - 2026-01-31".
+name: GitHub Release
+
+on:
+  workflow_call:
+    inputs:
+      tag-prefix:
+        description: Stripped from the tag to get the version (tag v1.2.3 -> 1.2.3)
+        type: string
+        default: v
+      version-property:
+        description: gradle.properties key that must equal the version; empty skips the check
+        type: string
+        default: versionName
+      changelog:
+        type: string
+        default: CHANGELOG.md
+      check-only:
+        description: Only validate, don't create the release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag, version and changelog
+        env:
+          PREFIX: ${{ inputs.tag-prefix }}
+          PROPERTY: ${{ inputs.version-property }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#"$PREFIX"}"
+          if [ -n "$PROPERTY" ]; then
+            actual=$(sed -nE "s/^${PROPERTY}[[:space:]]*=[[:space:]]*//p" gradle.properties | tr -d '[:space:]')
+            if [ "$actual" != "$version" ]; then
+              echo "::error::tag $tag does not match $PROPERTY=$actual in gradle.properties"
+              exit 1
+            fi
+          fi
+          # relative links (docs/..., MIGRATION.md) are pinned to the tag so they resolve from the release page
+          awk -v v="$version" '/^## /{ s = $2; gsub(/[][]/, "", s); f = (s == v); next } f' "$CHANGELOG" \
+            | sed -E "s#\]\(((docs/|[A-Za-z_-]+\.md)[^)]*)\)#](https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/\1)#g" \
+            > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::no '## $version' section in $CHANGELOG"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create or update GitHub Release
+        if: ${{ !inputs.check-only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$tag" --verify-tag --title "$tag" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
